@@ -52,10 +52,9 @@ class Config:
     max_length: int = 2048
 
     # LoRA
-    lora_r: int = 16            # rank — raise to 32 for more capacity
-    lora_alpha: int = 32        # scaling factor, convention: 2 × lora_r
+    lora_r: int = 16            
+    lora_alpha: int = 32        
     lora_dropout: float = 0.05
-    # All attention + SwiGLU-FFN projections — better than attention-only targeting
     target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -63,9 +62,9 @@ class Config:
 
     # Training
     per_device_train_batch_size: int = 2
-    gradient_accumulation_steps: int = 8   # effective batch size = 16
+    gradient_accumulation_steps: int = 8   
     num_train_epochs: int = 3
-    learning_rate: float = 5e-5            # IPO prefers a lower LR than SFT
+    learning_rate: float = 5e-5          
     warmup_ratio: float = 0.05
 
     # IPO / DPO hyper-params
@@ -88,7 +87,6 @@ cfg = Config()
 # 2. HuggingFace Hub authentication
 
 def authenticate_hub(token: Optional[str] = None) -> None:
-    # Reads HF_TOKEN from env by default — never hard-code the token here
     resolved_token = token or os.environ.get("HF_TOKEN")
     login(token=resolved_token)
     logger.info("Authenticated with HuggingFace Hub.")
@@ -144,7 +142,6 @@ def load_triplet_files(
 # 4. Prompt formatting — Mistral chat template
 
 def build_mistral_prompt(input_text: str, system_prompt: Optional[str] = None) -> str:
-    # Formats the prompt using Mistral's [INST] template — no assistant turn included.
     # DPOTrainer receives (prompt, chosen, rejected) separately and concatenates internally.
     if system_prompt is None:
         system_prompt = (
@@ -233,7 +230,7 @@ def build_bnb_config() -> BitsAndBytesConfig:
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,  # quantises the quant constants too, saves ~0.4 GB
+        bnb_4bit_use_double_quant=True, 
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
@@ -248,7 +245,6 @@ def load_model(model_id: str, bnb_config: BitsAndBytesConfig, adapter_name: str 
         device_map="auto",          # spreads layers across all available GPUs
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        # attn_implementation="flash_attention_2",  # uncomment if FA-2 is installed
     )
 
     if adapter_name:

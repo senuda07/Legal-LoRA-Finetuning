@@ -79,7 +79,6 @@ cfg = Config()
 # 2. HuggingFace Hub authentication
 
 def authenticate_hub(token: Optional[str] = None) -> None:
-    # Reads HF_TOKEN from env by default — never hard-code the token here
     resolved_token = token or os.environ.get("HF_TOKEN")
     login(token=resolved_token)
     logger.info("Authenticated with HuggingFace Hub.")

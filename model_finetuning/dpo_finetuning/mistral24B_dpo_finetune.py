@@ -98,7 +98,6 @@ cfg = Config()
 
 def authenticate_hub(token: Optional[str] = None) -> None:
     # Log into HuggingFace Hub. WRITE permission is required to push adapters.
-    # Store your token in HF_TOKEN env var — never hard-code it here.
     resolved_token = token or os.environ.get("HF_TOKEN")
     login(token=resolved_token)
     logger.info("Authenticated with HuggingFace Hub.")
