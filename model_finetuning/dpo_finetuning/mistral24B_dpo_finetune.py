@@ -1,3 +1,5 @@
+# Imports
+
 import logging
 import os
 from dataclasses import dataclass, field
@@ -7,9 +9,21 @@ from typing import List, Optional
 import torch
 from datasets import Dataset
 from huggingface_hub import login
-from peft import LoraConfig, PeftModel, TaskType, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import (
+    LoraConfig,
+    PeftModel,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 from trl import DPOConfig, DPOTrainer
+
+# Logging
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,74 +33,98 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# 1. Central configuration
+
 @dataclass
 class Config:
-    # Base model to fine-tune; swap this out if using a different Mistral variant
+
+    # Model 
+    # HuggingFace model repo used as the base
     base_model_id: str = "mistralai/Mistral-Small-24B-Instruct-2501"
 
-    # Each directory must contain .txt files with matching filenames across all three folders
+    # Data 
+    # Each directory must contain .txt files with matching filenames across all three
     inputs_dir: str = "chunked_train_data"
     preferred_dir: str = "openai_summaries_train_chunked"
     rejected_dir: str = "mistral24B_summaries_train_chunked"
 
-    # Hub repo where the final LoRA adapter will be uploaded
+    # Hub 
+    # HuggingFace Hub destination for the fine-tuned adapter
     hf_repo_id: str = "senuda07/legal-mistral-dpo"
 
-    # Keep max_prompt_length well below max_length to leave room for both chosen and rejected completions
+    # Sequence lengths 
+    # Keep max_prompt_length well below max_length to leave room for
+    # both chosen and rejected completions inside the DPO context window.
     max_prompt_length: int = 1024
     max_length: int = 2048
 
-    # LoRA rank and alpha control adapter capacity; alpha=2*r is a standard convention
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    # Targeting all attention + SwiGLU-FFN projections gives better coverage than attention-only
+    # LoRA
+    lora_r: int = 16            # rank — raise to 32 for more capacity
+    lora_alpha: int = 32        # scaling factor, convention: 2 × lora_r
+    lora_dropout: float = 0.05  # dropout for regularisation
+    # Target all attention + SwiGLU-FFN projections for best task coverage
     target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
     ])
 
+    # Training
     per_device_train_batch_size: int = 2
-    # Effective batch size = per_device_train_batch_size * gradient_accumulation_steps = 16
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 8   # → effective batch size = 16
     num_train_epochs: int = 3
-    # IPO benefits from a lower LR than standard SFT to avoid over-optimising the implicit reward
-    learning_rate: float = 5e-5
+    learning_rate: float = 5e-5            # IPO prefers a lower LR than SFT
     warmup_ratio: float = 0.05
 
-    # IPO beta controls regularisation strength; 0.1 is conservative and stable for legal tasks
+    # IPO / DPO hyper-params
+    # loss_type="ipo" selects Identity Preference Optimisation.
+    # beta=0.1 is conservative and stable for legal summarisation tasks.
     beta: float = 0.1
-    # "ipo" selects Identity Preference Optimisation; alternatives: "sigmoid" (standard DPO), "hinge", "kto_pair"
     loss_type: str = "ipo"
 
-    val_split: float = 0.2
+    # Validation split
+    val_split: float = 0.2   # 20% held out for validation
 
-    output_dir: str = "./dpo_checkpoints"
+    # Misc 
     push_private: bool = False
     seed: int = 42
 
 
+# Instantiate the global config used throughout the script
 cfg = Config()
 
 
+
+# 2. HuggingFace Hub authentication
+
 def authenticate_hub(token: Optional[str] = None) -> None:
-    # Reads HF_TOKEN from environment if no token is passed explicitly; requires write permission for Hub push
+    # Log into HuggingFace Hub. WRITE permission is required to push adapters.
+    # Store your token in HF_TOKEN env var — never hard-code it here.
     resolved_token = token or os.environ.get("HF_TOKEN")
     login(token=resolved_token)
     logger.info("Authenticated with HuggingFace Hub.")
 
 
-def load_triplet_files(inputs_dir: str, preferred_dir: str, rejected_dir: str) -> list[dict]:
+# 3. Dataset loading — triplet file pairs
+
+# Load (input, preferred, rejected) triplets from the specified directories.
+def load_triplet_files(
+    inputs_dir: str,
+    preferred_dir: str,
+    rejected_dir: str,
+) -> list[dict]:
     input_paths = sorted(Path(inputs_dir).glob("*.txt"))
     if not input_paths:
-        raise FileNotFoundError(f"No .txt input files found in '{inputs_dir}'.")
+        raise FileNotFoundError(
+            f"No .txt input files found in '{inputs_dir}'. "
+            "Verify the directory path is correct."
+        )
 
     triplets, missing = [], []
     for inp_path in input_paths:
-        # Matching is done by filename stem, so all three directories must use identical filenames
         pref_path = Path(preferred_dir) / inp_path.name
         rej_path = Path(rejected_dir) / inp_path.name
 
+        # Skip this file if either counterpart is missing
         if not pref_path.exists() or not rej_path.exists():
             missing.append(inp_path.name)
             continue
@@ -98,72 +136,122 @@ def load_triplet_files(inputs_dir: str, preferred_dir: str, rejected_dir: str) -
         })
 
     if missing:
-        # Incomplete triplets are skipped rather than failing the entire run
-        logger.warning("%d file(s) have incomplete triplets and will be skipped: %s", len(missing), missing[:10])
+        logger.warning(
+            "%d input file(s) have incomplete triplets and will be skipped: %s",
+            len(missing), missing[:10],
+        )
 
     if not triplets:
-        raise RuntimeError("No valid (input, preferred, rejected) triplets found.")
+        raise RuntimeError(
+            "No valid (input, preferred, rejected) triplets were found. "
+            "Ensure filenames match exactly across all three directories."
+        )
 
-    logger.info("Loaded %d triplets.", len(triplets))
+    logger.info("Loaded %d input-preferred-rejected triplets.", len(triplets))
     return triplets
 
 
+# 4. Prompt formatting — Mistral chat template
+
 def build_mistral_prompt(input_text: str, system_prompt: Optional[str] = None) -> str:
-    # Prompt contains only system + user turn; DPOTrainer appends chosen/rejected completions internally
+
     if system_prompt is None:
         system_prompt = (
-            "You are a legal research assistant specialized in summarizing legislative documents. "
-            "The included text is part of a larger summary. "
-            "Create accurate, concise, and short summaries in plain English. "
-            "Preserve key legal clauses, definitions, obligations, and relationships. "
-            "Do not introduce new information. Avoid unnecessary simplification. "
-            "Maintain legal terminology where important.\n\nText:"
+            """You are a legal research assistant.
+
+            You are a legal research assistant specialized in summarizing legislative documents.
+            The included text is part of a larger summary.
+
+            Create accurate, concise, and short summaries in plain English.
+            Preserve key legal clauses, definitions, obligations, and relationships.
+            Do not introduce new information.
+            Avoid unnecessary simplification.
+            Maintain legal terminology where important.
+            
+            Text:
+            """
         )
-    # Mistral chat format: <s>[INST] <<SYS>> system <</SYS>> user [/INST]
-    return f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{input_text} [/INST]"
+
+    return (
+        f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n"
+        f"{input_text} [/INST]"
+    )
 
 
-def build_dpo_dataset(inputs_dir: str, preferred_dir: str, rejected_dir: str) -> Dataset:
+def build_dpo_dataset(
+    inputs_dir: str,
+    preferred_dir: str,
+    rejected_dir: str,
+) -> Dataset:
+
     triplets = load_triplet_files(inputs_dir, preferred_dir, rejected_dir)
-    # DPOTrainer expects exactly three columns: prompt, chosen, rejected
-    records = [
-        {
+
+    records = []
+    for t in triplets:
+        records.append({
             "prompt": build_mistral_prompt(t["input_text"]),
             "chosen": t["preferred_text"],
             "rejected": t["rejected_text"],
-        }
-        for t in triplets
-    ]
+        })
+
     dataset = Dataset.from_list(records)
-    logger.info("DPO dataset created — %d examples.", len(dataset))
+    logger.info("DPO dataset created — %d examples total.", len(dataset))
     return dataset
 
 
+# 5. Train / validation split
+
 def split_dataset(dataset: Dataset, val_split: float, seed: int):
+    # Split dataset into train and validation subsets with reproducible shuffling
     split = dataset.train_test_split(test_size=val_split, seed=seed, shuffle=True)
     train_ds, val_ds = split["train"], split["test"]
-    logger.info("Train: %d  |  Validation: %d", len(train_ds), len(val_ds))
+    logger.info(
+        "Split — Train: %d samples  |  Validation: %d samples",
+        len(train_ds), len(val_ds),
+    )
     return train_ds, val_ds
 
 
-def load_tokenizer(model_id: str) -> AutoTokenizer:
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=False)
+# 6. Tokenizer
 
-    # Mistral has no dedicated pad token; reusing EOS satisfies the data collator without introducing a new embedding
+def load_tokenizer(model_id: str) -> AutoTokenizer:
+    # Load and configure the tokenizer.
+    # Mistral has no dedicated pad token, so EOS is reused to satisfy
+    # the data collator. Right-padding is safer for causal attention masks.
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        use_fast=False,
+    )
+
+    # Reuse EOS as the pad token since Mistral has none
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    # Right-padding keeps attention masks correct for causal LM training; left-padding can corrupt loss computation
+
+    # Right-padding is safer than left-padding for causal attention masks
     tokenizer.padding_side = "right"
 
-    logger.info("Tokenizer loaded — vocab size: %d", tokenizer.vocab_size)
+    logger.info(
+        "Tokenizer loaded — vocab size: %d  |  pad token: '%s'",
+        tokenizer.vocab_size,
+        tokenizer.pad_token,
+    )
     return tokenizer
 
 
+
+# 7. BitsAndBytes 4-bit config
+
 def build_bnb_config() -> BitsAndBytesConfig:
-    # NF4 (Normal Float 4-bit) is better suited than INT4 for normally-distributed neural network weights
-    # double_quant quantises the quantisation constants themselves, saving ~0.4 GB on a 24B model
-    # bfloat16 compute dtype dequantises to BF16 for the forward/backward pass; numerically stable on A100/H100
+    # Build the 4-bit NF4 quantisation config for VRAM efficiency.
+    #
+    # Key choices:
+    #   nf4          — Normal Float 4-bit; optimal for neural network weights
+    #   double_quant — Quantises the quant constants too, saves ~0.4 GB
+    #   bfloat16     — Dequantises to BF16 for stable forward/backward pass
+
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -172,45 +260,63 @@ def build_bnb_config() -> BitsAndBytesConfig:
     )
 
 
+# 8. Model loading (4-bit NF4 + BF16 compute)
+
 def load_model(model_id: str, bnb_config: BitsAndBytesConfig) -> AutoModelForCausalLM:
+
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb_config,
-        device_map="auto",          # spreads layers across all available GPUs automatically
+        device_map="auto",
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        # attn_implementation="flash_attention_2",  # uncomment if FlashAttention-2 is installed; halves attention VRAM
     )
-    model.config.use_cache = False      # KV cache is not needed during training
-    model.config.pretraining_tp = 1     # disables tensor parallelism used during pretraining
 
-    # prepare_model_for_kbit_training enables gradient checkpointing and upcasts layer norms
-    # to full precision, both of which are required for numerically stable QLoRA training
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    model.config.use_cache = False
+    model.config.pretraining_tp = 1
+    model = prepare_model_for_kbit_training(
+        model, use_gradient_checkpointing=True
+    )
 
-    logger.info("Model loaded — VRAM: %.2f GB", model.get_memory_footprint() / (1024 ** 3))
+    vram_gb = model.get_memory_footprint() / (1024 ** 3)
+    logger.info("Model loaded — VRAM footprint: %.2f GB", vram_gb)
     return model
 
 
+# 9. LoRA adapter configuration
+
+# Build the LoRA adapter config for QLoRA DPO.
+
 def build_lora_config(config: Config) -> LoraConfig:
+
     lora_cfg = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
         target_modules=config.target_modules,
-        bias="none",                # training bias terms alongside LoRA adds overhead with minimal benefit
+        bias="none",
         task_type=TaskType.CAUSAL_LM,
     )
-    logger.info("LoRA — r=%d  alpha=%d  dropout=%.2f", config.lora_r, config.lora_alpha, config.lora_dropout)
+    logger.info(
+        "LoRA config — r=%d  alpha=%d  dropout=%.2f  modules=%s",
+        config.lora_r, config.lora_alpha, config.lora_dropout,
+        config.target_modules,
+    )
     return lora_cfg
 
 
+
+# 10. DPO training arguments
+
 def build_dpo_config(config: Config) -> DPOConfig:
+
     return DPOConfig(
+        # — Output and logging —
         output_dir=config.output_dir,
         logging_steps=10,
-        report_to="none",           # disable W&B / TensorBoard; change to "wandb" if tracking is needed
+        report_to="none",
 
+        # — Training schedule —
         num_train_epochs=config.num_train_epochs,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_train_batch_size,
@@ -219,29 +325,35 @@ def build_dpo_config(config: Config) -> DPOConfig:
         lr_scheduler_type="cosine",
         warmup_ratio=config.warmup_ratio,
 
+        # — VRAM optimisation —
         bf16=True,
-        fp16=False,                 # fp16 and bf16 are mutually exclusive; bf16 is preferred on Ampere/Hopper
-        gradient_checkpointing=True,            # trades ~20% throughput for ~40% VRAM reduction
-        optim="paged_adamw_8bit",               # paged optimiser prevents OOM spikes from optimiser state
+        fp16=False,
+        gradient_checkpointing=True,
+        optim="paged_adamw_8bit",
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
 
+        # — Checkpointing — save every 50 steps, keep best 3 by eval_loss —
         eval_strategy="steps",
         eval_steps=50,
         save_strategy="steps",
         save_steps=50,
-        save_total_limit=3,         # keep only the 3 most recent checkpoints to save disk space
+        save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
 
+        # — IPO / DPO hyper-params —
         beta=config.beta,
-        loss_type=config.loss_type,
+        loss_type=config.loss_type,    # "ipo"
 
+        # — Misc —
         seed=config.seed,
         push_to_hub=False,
-        remove_unused_columns=False,    # must be False; DPOTrainer needs all three dataset columns
+        remove_unused_columns=False,
     )
 
+
+# 11. DPO training loop
 
 def run_dpo_training(
     model: AutoModelForCausalLM,
@@ -251,29 +363,33 @@ def run_dpo_training(
     val_dataset: Dataset,
     dpo_cfg: DPOConfig,
 ) -> DPOTrainer:
-    # ref_model=None instructs DPOTrainer to compute reference log-probs from the base model in a no-grad pass,
-    # avoiding a second full model load and saving ~12 GB VRAM with no measurable quality loss for QLoRA DPO
+
     trainer = DPOTrainer(
         model=model,
-        ref_model=None,
+        ref_model=None,         # share base as reference (saves ~12 GB VRAM)
         args=dpo_cfg,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         processing_class=tokenizer,
-        peft_config=lora_cfg,       # LoRA is injected here by DPOTrainer so it can manage the policy/reference split
+        peft_config=lora_cfg,   # DPOTrainer applies LoRA internally
     )
 
+    # Log trainable parameter count after LoRA injection
     trainer.model.print_trainable_parameters()
+
     logger.info("Starting IPO/DPO training …")
     train_result = trainer.train()
-    logger.info("Training complete — %s", train_result.metrics)
+    logger.info("Training complete.  Metrics: %s", train_result.metrics)
     trainer.log_metrics("train", train_result.metrics)
     trainer.save_metrics("train", train_result.metrics)
+
     return trainer
 
 
+# 12. Validation evaluation
+
+# Run evaluation on the validation set and log metrics.
 def evaluate(trainer: DPOTrainer) -> dict:
-    # Key metrics: eval_loss, rewards/chosen, rewards/rejected, rewards/accuracies, rewards/margins
     logger.info("Evaluating on validation set …")
     metrics = trainer.evaluate()
     logger.info("Eval metrics: %s", metrics)
@@ -282,21 +398,54 @@ def evaluate(trainer: DPOTrainer) -> dict:
     return metrics
 
 
-def save_adapter(trainer: DPOTrainer, tokenizer: AutoTokenizer, output_dir: str) -> str:
-    # Only the LoRA delta weights are saved (not the full 24B base), keeping the checkpoint to ~100–400 MB
+# 13. Save adapter locally
+
+def save_adapter(
+    trainer: DPOTrainer,
+    tokenizer: AutoTokenizer,
+    output_dir: str,
+) -> str:
+    # Save the LoRA adapter weights and tokenizer to a local directory.
+    # Only the adapter delta weights are saved (not the full 24B base),
+    # keeping the checkpoint compact — typically 100–400 MB.
+
     adapter_path = os.path.join(output_dir, "final_adapter")
     trainer.model.save_pretrained(adapter_path)
     tokenizer.save_pretrained(adapter_path)
-    logger.info("Adapter saved to '%s'.", adapter_path)
+    logger.info("Adapter saved locally to '%s'.", adapter_path)
     return adapter_path
 
 
-def push_to_hub(trainer: DPOTrainer, tokenizer: AutoTokenizer, config: Config) -> None:
-    logger.info("Pushing adapter to Hub — %s", config.hf_repo_id)
-    trainer.model.push_to_hub(config.hf_repo_id, use_auth_token=True, private=config.push_private)
-    tokenizer.push_to_hub(config.hf_repo_id, use_auth_token=True, private=config.push_private)
-    logger.info("Upload complete — https://huggingface.co/%s", config.hf_repo_id)
 
+# 14. Push to HuggingFace Hub
+
+ # Push the fine-tuned LoRA adapter and tokenizer to HuggingFace Hub.
+
+def push_to_hub(
+    trainer: DPOTrainer,
+    tokenizer: AutoTokenizer,
+    config: Config,
+) -> None:
+
+    logger.info(
+        "Pushing adapter to HuggingFace Hub — repo: %s", config.hf_repo_id
+    )
+    trainer.model.push_to_hub(
+        config.hf_repo_id,
+        use_auth_token=True,
+        private=config.push_private,
+    )
+    tokenizer.push_to_hub(
+        config.hf_repo_id,
+        use_auth_token=True,
+        private=config.push_private,
+    )
+    logger.info(
+        "Upload complete.  View at: https://huggingface.co/%s", config.hf_repo_id
+    )
+
+
+# 15. Inference smoke test
 
 def run_inference_smoke_test(
     base_model_id: str,
@@ -304,7 +453,10 @@ def run_inference_smoke_test(
     bnb_config: BitsAndBytesConfig,
     max_new_tokens: int = 256,
 ) -> str:
+    # Load the saved adapter and run a sample inference to verify the output.
+
     tok = AutoTokenizer.from_pretrained(adapter_path)
+
     base = AutoModelForCausalLM.from_pretrained(
         base_model_id,
         quantization_config=bnb_config,
@@ -316,8 +468,9 @@ def run_inference_smoke_test(
     peft_model.eval()
 
     sample_prompt = build_mistral_prompt(
-        "Summarise the key obligations of the lessee under a standard commercial lease, "
-        "including rent payment, maintenance duties, and obligations upon lease termination."
+        "Summarise the key obligations of the lessee under a standard "
+        "commercial lease, including rent payment, maintenance duties, "
+        "and obligations upon lease termination."
     )
 
     inputs = tok(sample_prompt, return_tensors="pt").to(peft_model.device)
@@ -325,30 +478,50 @@ def run_inference_smoke_test(
         output_ids = peft_model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,        # greedy decoding for a deterministic, reproducible smoke test
+            do_sample=False,    # greedy decoding for a deterministic smoke test
             temperature=1.0,
         )
 
-    # Slice off the prompt tokens so only the generated completion is decoded
-    generated = tok.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-    logger.info("Smoke test complete.")
+    # Slice off the prompt tokens and decode only the generated portion
+    generated = tok.decode(
+        output_ids[0][inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
+    logger.info("Smoke test generation complete.")
     return generated
 
 
+# 16. Main entry point
+
 def main():
+
+    # Step 1 – Authentication
     authenticate_hub()
 
-    dataset = build_dpo_dataset(cfg.inputs_dir, cfg.preferred_dir, cfg.rejected_dir)
+    # Step 2 – Dataset
+    dataset = build_dpo_dataset(
+        cfg.inputs_dir,
+        cfg.preferred_dir,
+        cfg.rejected_dir,
+    )
+
+    # Step 3 – Train / val split
     train_dataset, val_dataset = split_dataset(dataset, cfg.val_split, cfg.seed)
 
+    # Step 4 – Tokenizer
     tokenizer = load_tokenizer(cfg.base_model_id)
 
+    # Step 5 & 6 – Build quant config then load model in 4-bit
     bnb_config = build_bnb_config()
     model = load_model(cfg.base_model_id, bnb_config)
 
+    # Step 7 – LoRA config
     lora_cfg = build_lora_config(cfg)
+
+    # Step 8 – DPO training arguments
     dpo_cfg = build_dpo_config(cfg)
 
+    # Step 9 – Train
     trainer = run_dpo_training(
         model=model,
         tokenizer=tokenizer,
@@ -358,10 +531,16 @@ def main():
         dpo_cfg=dpo_cfg,
     )
 
+    # Step 10 – Evaluate
     evaluate(trainer)
+
+    # Step 11 – Save locally
     adapter_path = save_adapter(trainer, tokenizer, cfg.output_dir)
+
+    # Step 12 – Push to Hub
     push_to_hub(trainer, tokenizer, cfg)
 
+    # Step 13 – Smoke test
     logger.info("Running inference smoke test …")
     response = run_inference_smoke_test(cfg.base_model_id, adapter_path, bnb_config)
     print("\n=== Smoke Test Response ===")
